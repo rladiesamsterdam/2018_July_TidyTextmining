@@ -1,0 +1,442 @@
+---
+title: "Tidy Text Mining workshop"
+output: html_document 
+---
+#### html_notebook for tidy text mining workshop
+check out tidytextmining.com
+
+```{r init}
+options(stringsAsFactors = F)
+options(scipen = 999)
+
+library(tidyverse)
+library(tidytext)
+library(udpipe)
+library(feather)
+```
+
+Preparation of the data
+```{r, echo = F}
+raw_df <- read_csv("twitter-airline-sentiment.csv")
+raw_df <- raw_df %>%select(tweet_id, name, text, user_timezone, tweet_created)
+write_csv(raw_df, "twitter_airline_sentiment.csv")
+``` 
+
+------------------------------------------------------------------------------------------------
+## Step 1: read in the raw twitter data
+------------------------------------------------------------------------------------------------
+
+```{r}
+df<- read_csv("twitter_airline_sentiment.csv")
+str(df)
+```
+
+------------------------------------------------------------------------------------------------
+## Step 2: regex: extracting digits, the airline, #
+------------------------------------------------------------------------------------------------
+
+
+### Step 2 example:  regex extracting the airline per tweet
+```{r}
+tweet <- "@virginamerica seriously would pay $30 a flight for seats that didn't have this playing.\nit's really the only &bad thing about flying va &x"
+
+str_view_all(tweet, "would")
+str_view_all(tweet, "\\s")
+str_view_all(tweet, "(?<=&)\\w+")
+str_view_all(tweet, "(?<=\\$)\\w+")
+```
+
+### Step 2 solution:  regex extracting the airline per tweet 
+```{r}
+df <- df %>% mutate(digits = str_extract_all(text, "\\d+"),
+                    airline = tolower(str_extract(text, "(?<=@)\\w+")),
+                    hashtag = str_extract_all(text, "(?<=#)\\w+"))
+
+df_airlines <- df %>%
+  filter(airline %in% c("americanair", "jetblue", "southwestair", "united", "usairways", "virginamerica")) %>%
+  select(tweet_id, text, airline)%>%
+    mutate(text =  tolower(as.character(iconv(text, 'UTF-8', 'ASCII'))))
+
+write_feather(df_airlines, "df_airlines.feather")
+```
+
+
+------------------------------------------------------------------------------------------------
+## Step 3: Tidy text mining
+------------------------------------------------------------------------------------------------
+
+### Step 3 example: unnest tokens
+```{r}
+df_airlines <- read_feather("df_airlines.feather")
+
+tidy_tweet <- df_airlines%>%
+  select(tweet_id, airline, text)%>%
+  unnest_tokens(word, text)
+
+write_feather(tidy_tweet, "tidy_tweet.feather")
+
+glimpse(tidy_tweet)
+```
+
+### Step 3 example: use geom_col
+```{r, fig.height=2}
+data.frame(bars = c("a", "b"), values = c(2,4))%>%
+  ggplot(aes(bars, values))+
+  geom_col()
+```
+
+Get the top 10 words per airline!
+
+### Step 3 Solution: top 10 words overall
+```{r}
+tidy_tweet <- read_feather("tidy_tweet.feather")
+
+tidy_tweet %>%
+  count(word)%>%
+  arrange(-n)%>%
+  slice(1:10)%>%
+  ggplot(aes(word, n))+
+  geom_col()+
+  coord_flip()
+```
+
+### Step 3 Solution: top 10 words per airline
+```{r}
+tidy_tweet %>%
+  count(airline, word) %>%
+  group_by(airline) %>%
+  arrange(airline, -n)%>%
+  slice(1:10) %>%
+  ggplot(aes(word, n))+
+  geom_col()+
+  facet_wrap(~airline)+
+  coord_flip()
+```
+
+------------------------------------------------------------------------------------------------
+## Step 4: lemmatization and cleaning
+------------------------------------------------------------------------------------------------
+
+### Step 4 lemmatization and cleaning: creating of next dataset
+```{r}
+df_airlines <- read_feather("df_airlines.feather")
+
+tweet_ids <- c("570300767074181120", "570295459631263744", "570289724453216256", "56894919977915596", "568946502615179264", "569508336594505728", "569504299992141824", "569506408145784832")
+
+df_mini <- df_airlines %>% filter(tweet_id %in% tweet_ids)
+write_feather(df_mini, "df_mini.feather")
+glimpse(df_mini)
+```
+
+### Step 4 lemmatization and cleaning: example
+```{r, cache=T}
+
+# load the tagging models
+dl <- udpipe_download_model(language = "english")
+dl
+
+udmodel_english <- udpipe_load_model(file = "english-ud-2.0-170801.udpipe")
+udmodel_english
+
+# load the data
+df_mini <- read_feather("df_mini.feather")
+df_mini$text[1]
+
+# do for one
+lemma_example <- udpipe_annotate(udmodel_english, 
+                                 x = df_mini$text[1], doc_id = df_mini$tweet_id[1],
+                                 parser = "none", tagger = "default ", trace = FALSE)  
+
+str(lemma_example)
+
+# in a tidy format and add airline
+lemma_example <- as.data.frame(lemma_example) %>%
+  mutate(airline = df_mini$airline[1])
+
+View(lemma_example)
+
+```
+
+
+### Step 4 Solution: Lemmatization and Cleaning: tagging solution
+```{r, cache=T}
+# progress bar because it can take while
+
+annotate_dataset <- function(dataset, text, doc_id){
+  pb <- winProgressBar(title="Progress", min = 0, max = nrow(dataset) , width = 300)    
+  
+  lemma <- data.frame()
+  
+  for(i in 1:nrow(dataset)){ 
+    lemma_one <- udpipe_annotate(udmodel_english, x = text[i], doc_id = doc_id[i],
+                                     parser = "none", tagger = "default ", trace = FALSE)  
+    
+    lemma <- bind_rows(lemma, as.data.frame(lemma_one))
+    setWinProgressBar(pb, i, title=paste("Trial:", i, "out of", nrow(dataset), "done"))
+    
+  }
+  
+  return(lemma)
+}
+
+lemma <- annotate_dataset(dataset = df_airlines, text = df_airlines$text, doc_id = df_airlines$tweet_id)
+
+glimpse(lemma)
+
+write_feather(lemma, "lemma.feather")
+
+
+```
+
+
+### Step 4 Lemmatization and Cleaning: cleaning solution
+
+```{r}
+lemma <-read_feather("lemma.feather")
+
+tidy_lemma <- lemma %>%
+  rename(tweet_id = doc_id,
+         word = token) %>%
+  left_join(df_airlines%>% 
+              select(tweet_id, airline)%>%
+              mutate(tweet_id = as.character(tweet_id))
+            )
+
+#cleanen
+blacklist <-   c("americanair", "jetblue", "jet blue","southwestair", "united","unit",
+                 "virginamerican", "usairways", "usairway", "virginamerica", "southwestay",
+                 "virgin", "@americanair", "@jetblue", "@jet blue","@southwestair", "@united",
+                  "@unit","@usairways", "@virginamerica", "http","t.co", "na", "not", "add",    "amp", "", "flight")
+
+clean_upos <- c("AUX","PRON","CCONJ","SCONJ", "PUNCT", "SYM", "X", "NUM", "PART") # "ADP",
+
+tidy_lemma <- tidy_lemma %>%
+  select(airline, tweet_id, word, lemma, token_id, upos)%>%
+  filter(!upos %in% clean_upos)%>%
+  mutate(word = str_remove_all(word, "[:punct:]|[:digit:]"), ### could also been done earlier in the process
+         lemma = str_remove_all(lemma, "[:punct:]|[:digit:]"))%>%
+  filter(!lemma %in% blacklist,
+         !is.na(word))%>%
+  anti_join(stop_words)
+
+write_feather(tidy_lemma, "tidy_lemma.feather")
+
+glimpse(tidy_lemma)
+```
+
+------------------------------------------------------------------------------------------------
+## Step 5: Visualize the cleaned data
+------------------------------------------------------------------------------------------------
+What are the top words now?
+
+### Step 5: example with the uncleaned data
+```{r}
+tidy_tweet %>%
+  count(airline, word) %>%
+  group_by(airline) %>%
+  arrange(airline, -n)%>%
+  slice(1:10) %>%
+  ggplot(aes(word, n))+
+  geom_col()+
+  facet_wrap(~airline, scales = "free")+
+  coord_flip()
+```
+
+### Step 5: solution with the cleaned data
+```{r}
+tidy_lemma <- read_feather("tidy_lemma.feather")
+
+tidy_lemma%>%
+  count(airline, lemma) %>%
+  group_by(airline)%>%
+  arrange(-n)%>%
+  slice(1:10)%>%
+  ggplot(aes(lemma, n))+
+  geom_col()+
+  facet_wrap(~airline, scales = "free")+
+  coord_flip()
+``` 
+
+### Step 5: bonus of n-grams
+```{r}
+blacklist2 <-   c("americanair", "jetblue", "jet blue","southwestair", "united","unit",
+                 "virginamerican", "usairways", "usairway", "virginamerica", "southwestay",
+                 "virgin", "@americanair", "@jetblue", "@jet blue","@southwestair", "@united",
+                  "@unit","@usairways", "@virginamerica", "http","t.co", "na", "not", "add",    "amp", "")
+
+
+lemma %>%
+  rename(tweet_id = doc_id) %>%
+  left_join(df_airlines%>% 
+              select(tweet_id, airline)%>%
+              mutate(tweet_id = as.character(tweet_id))
+            ) %>%
+  filter(upos %in% c("VERB","NOUN"),
+         !lemma %in% blacklist2) %>%
+  group_by(tweet_id)%>%
+  summarise(text = paste(lemma, collapse = " "),
+            airline = first(airline)) %>%
+  ungroup()%>%
+  unnest_tokens(ngram, text,token="ngrams", n=2) %>%
+  filter(!is.na(ngram))%>%
+  count(airline, ngram)%>%
+  group_by(airline)%>%
+  arrange(-n)%>%
+  slice(1:10)%>%
+  ggplot(aes(ngram, n))+
+  geom_col()+
+  facet_wrap(~airline, scales = "free")+
+  coord_flip()
+  
+```
+
+------------------------------------------------------------------------------------------------
+## Step 6: Sentiment Analysis
+------------------------------------------------------------------------------------------------
+
+### Step 6: example of the sentiment dictionaries
+```{r}
+get_sentiments("nrc")
+get_sentiments("bing")
+get_sentiments("afinn")
+```
+
+
+### step 6: Solution: Positive and negative sentiment with the nrc 
+
+```{r}
+sent_nrc_ps <- get_sentiments("nrc")%>%
+  filter(sentiment %in% c("positive", "negative"))
+
+tidy_lemma%>%
+  group_by(airline)%>%
+  mutate(total = n())%>%
+  ungroup()%>%
+  inner_join(sent_nrc_ps)%>% ## joinen by word and not lemma
+  count(airline, total, sentiment)%>%
+  mutate(percent = (n/total)*100)%>%
+  ggplot(aes(airline, percent, fill = airline))+
+  geom_col(show.legend = F)+
+  coord_flip()+
+  facet_wrap(~sentiment)
+```
+
+------------------------------------------------------------------------------------------------
+## Step 7: Free format. What insight can you get from this data?
+------------------------------------------------------------------------------------------------
+
+## lets combine the sentiment data with other data
+```{r}
+tidy_lemma_time <- tidy_lemma %>%
+  left_join(df %>%
+              select(tweet_id, user_timezone, tweet_created)%>%
+              mutate(tweet_id = as.character(tweet_id)))
+
+write_feather(tidy_lemma_time, "tidy_lemma_time.feather")
+glimpse(tidy_lemma_time)
+
+```
+
+
+```{r}
+tidy_lemma <- read_feather("tidy_lemma.feather")
+
+sent_nrc <- get_sentiments("nrc")%>%
+  filter(!sentiment %in% c("positive", "negative"))
+
+tidy_lemma%>%
+  group_by(airline)%>%
+  mutate(total = n())%>%
+  ungroup()%>%
+  inner_join(sent_nrc)%>% ## let op we joinen hier op word, en niet op lemma
+  count(airline, total, sentiment)%>%
+  mutate(percent = (n/total)*100)%>%
+  ggplot(aes(airline, percent, fill = airline))+
+  geom_col(show.legend = F)+
+  coord_flip()+
+  facet_wrap(~sentiment)
+```
+
+The differences are quite small
+
+Are there differences between locations? Are some locations perceived as more negative than others?
+```{r}
+tidy_lemma_time <- read_feather("tidy_lemma_time.feather")
+
+time_zone <- tidy_lemma_time %>% 
+  count(user_timezone)%>% 
+  arrange(-n)%>% 
+  filter(n>200)%>%
+  pull(user_timezone)
+
+tidy_lemma_time %>% filter(user_timezone %in% time_zone)%>%
+  group_by(user_timezone)%>%
+  mutate(total = n())%>%
+  ungroup()%>%
+  inner_join(sent_nrc_ps)%>%
+  count(user_timezone, total, sentiment)%>%
+  mutate(percent = (n/total)*100)%>%
+  ggplot(aes(user_timezone, percent, fill = user_timezone))+
+  geom_col(show.legend = F)+
+  coord_flip()+
+  facet_wrap(~sentiment)
+
+```
+
+
+And are there differences between the different airlines?
+```{r}
+tidy_lemma_time %>% filter(user_timezone %in% time_zone)%>%
+  group_by(airline, user_timezone)%>%
+  mutate(total = n())%>%
+  ungroup()%>%
+  inner_join(sent_nrc_ps)%>% ## let op we joinen hier op word, en niet op lemma
+  count(user_timezone, airline, total, sentiment)%>%
+  # filter(n>10)%>%
+  mutate(percent = (n/total)*100)%>%
+  ggplot(aes(user_timezone, percent, fill = n))+
+  scale_fill_gradient(low = 'white', high = 'blue')+
+  geom_col(show.legend = T)+
+  coord_flip()+
+  facet_grid(airline~sentiment)
+
+ # scale_fill_gradient2(low = 'white', mid = 'blue', high = 'black', midpoint = 200)+
+```
+Due to the small dataset, the bins get really small this can give a wrong impression
+
+## look at the score of sentiment with the afinn set.
+
+```{r}
+sent_afinn <- get_sentiments("afinn")
+
+tidy_lemma_time_day <- tidy_lemma_time%>%
+  inner_join(sent_afinn)%>%
+  mutate(tweet_created = as.Date(tweet_created))%>%
+  group_by(airline, tweet_created)%>%
+  summarise(score = sum(score),
+            number_tweets = length(unique(tweet_id)))
+
+glimpse(tidy_lemma_time_day)
+
+``` 
+
+```{r}
+tidy_lemma_time_day %>%
+  ggplot(aes(tweet_created, number_tweets, color = airline))+
+  geom_line()
+``` 
+
+What happened at the 23th of feb?
+
+```{r}
+tidy_lemma_time_day %>%
+  ggplot(aes(tweet_created, score, color = airline))+
+  geom_line()+
+  geom_point(aes(size = number_tweets))
+``` 
+
+something unpleasant happened that did not just affect united airlines.
+
+
+
+
